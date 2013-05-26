@@ -147,7 +147,22 @@ int connector_push_packet(int fd, void *data, int len) {
     // 连接引用计数
     con->processing_count --;
     logging_trace("%s:%d %d push_packet %d bytes, processing_count %d", con->ip, con->port, fd, con->processing_count);
-    if(len == 0) {
+
+    if(con->closed_flag) {
+        if(len)
+            mem_free(data);
+        if(con->processing_count == 0) {
+            logging_trace("%s:%d %d check closed_flag processing_count 0", con->ip, con->port, fd);
+            connector_destroy(fd);
+        }
+        return 0;
+    }
+    if(!len && con->closing_flag && con->processing_count == 0 && con->send_q_count == 0) {
+        logging_trace("%s:%d %d check closing_flag processing_count 0, send_q_count 0", con->ip, con->port, fd);
+        connector_destroy(fd);
+        return -1;
+    }
+    if(!len) {
         return 0;
     }
     // 发送队列计数
@@ -174,35 +189,20 @@ int connector_push_packet(int fd, void *data, int len) {
     return con->send_q_count;
 }
 
-// -1，连接超时异常，需要清空事件
-int connector_check_one(int fd, struct timeval *tv, int idle_timeout_ms) {
+// -1，超时异常，需要清空事件
+int connector_check_timeout(int fd, struct timeval *tv, int idle_timeout_ms) {
     connector_t *con = connector_get_ptr(fd);
-    if(con == NULL)
+    if(con->closed_flag)
         return 0;
-    if(con->closed_flag && con->processing_count == 0) {
-        logging_trace("%s:%d %d check closed_flag processing_count 0", con->ip, con->port, fd);
-        connector_destroy(fd);
-        // 这里应该在之前清空过事件了，故不重复清除
-        return 0;
-    }
-    else if(con->closing_flag && con->processing_count == 0 && con->send_q_count == 0) {
-        logging_trace("%s:%d %d check closing_flag processing_count 0, send_q_count 0", con->ip, con->port, fd);
-        connector_destroy(fd);
-        // 这里需要清除可写事件，故返回-1
+    int milliseconds =
+        1000 * (tv->tv_sec - con->updated_at.tv_sec) +
+        (tv->tv_usec - con->updated_at.tv_usec) / 1000;
+    if(milliseconds > idle_timeout_ms) {
+        logging_trace("%s:%d %d check idle_timeout", con->ip, con->port, fd);
+        con->closed_flag = 1;
+        if(con->processing_count == 0)
+            connector_destroy(fd);
         return -1;
-    }
-    // 检查超时
-    if(tv) {
-        int milliseconds =
-            1000 * (tv->tv_sec - con->updated_at.tv_sec) +
-            (tv->tv_usec - con->updated_at.tv_usec) / 1000;
-        if(milliseconds > idle_timeout_ms) {
-            logging_trace("%s:%d %d check idle_timeout", con->ip, con->port, fd);
-            con->closed_flag = 1;
-            if(con->processing_count == 0)
-                connector_destroy(fd);
-            return -1;
-        }
     }
     return 0;
 }
@@ -237,8 +237,6 @@ int connector_recv(int fd) {
 int connector_send(int fd) {
     connector_t *con = connector_get_ptr(fd);
     while(1) {
-        //send_q_t *pre_ptr = &(con->send_q_head);
-        //send_q_t *s_ptr = pre_ptr->next;
         send_q_t **curr = &con->send_q_head;
         send_q_t *q_entry = *curr;
         if(q_entry == NULL)
@@ -267,6 +265,8 @@ int connector_send(int fd) {
             }
         }
     }
+    if(con->send_q_count == 0 && con->closing_flag && con->processing_count)
+        connector_destroy(fd);
     return con->send_q_count;
 }
 
